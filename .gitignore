@@ -1,2 +1,4 @@
 node_modules
 .env
+serviceAccount.json
+serviceAccount.base64.txt
