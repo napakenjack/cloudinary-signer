@@ -51,12 +51,10 @@ initFirebaseAdmin();
 
 // ---- Middleware: require x-signer-key ----
 function requireSignerKey(req, res, next) {
-  if (!SIGNER_KEY) return res.status(500).json({ error: "Server SIGNER_KEY not set" });
-
-  const key = req.header("x-signer-key");
-  if (!key || key !== SIGNER_KEY) {
-    return res.status(401).json({ error: "Invalid signer key" });
-  }
+  const expected = process.env.SIGNER_KEY;
+  const got = req.header("x-signer-key");
+  if (!expected) return res.status(500).json({ error: "Server SIGNER_KEY not set" });
+  if (!got || got !== expected) return res.status(401).json({ error: "Invalid signer key" });
   next();
 }
 
