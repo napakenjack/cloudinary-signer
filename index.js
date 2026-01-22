@@ -23,8 +23,7 @@ const API_SECRET = process.env.CLOUDINARY_API_SECRET;
 
 const SIGNER_KEY = process.env.SIGNER_KEY; // required
 const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || "").trim().toLowerCase(); // required
-
-const FIREBASE_SA_BASE64 = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64;
+const FIREBASE_SA_BASE64 = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64; // required
 
 // ---- Firebase Admin init ----
 function initFirebaseAdmin() {
@@ -49,12 +48,17 @@ function initFirebaseAdmin() {
 }
 initFirebaseAdmin();
 
+// ---- Optional: basic request log (helps Render logs) ----
+app.use((req, _res, next) => {
+  console.log("REQ", req.method, req.url);
+  next();
+});
+
 // ---- Middleware: require x-signer-key ----
 function requireSignerKey(req, res, next) {
-  const expected = process.env.SIGNER_KEY;
   const got = req.header("x-signer-key");
-  if (!expected) return res.status(500).json({ error: "Server SIGNER_KEY not set" });
-  if (!got || got !== expected) return res.status(401).json({ error: "Invalid signer key" });
+  if (!SIGNER_KEY) return res.status(500).json({ error: "Server SIGNER_KEY not set" });
+  if (!got || got !== SIGNER_KEY) return res.status(401).json({ error: "Invalid signer key" });
   next();
 }
 
@@ -68,13 +72,13 @@ async function requireAdmin(req, res, next) {
       return res.status(500).json({ error: "Server ADMIN_EMAIL not set" });
     }
 
-    const authHeader = req.header("authorization") || "";
-    const match = authHeader.match(/^Bearer (.+)$/i);
-    if (!match) {
+    const auth = req.header("authorization") || "";
+    const idToken = auth.startsWith("Bearer ") ? auth.slice(7).trim() : null;
+
+    if (!idToken) {
       return res.status(401).json({ error: "Missing Authorization Bearer token" });
     }
 
-    const idToken = match[1];
     const decoded = await admin.auth().verifyIdToken(idToken);
 
     const email = (decoded.email || "").trim().toLowerCase();
@@ -84,18 +88,12 @@ async function requireAdmin(req, res, next) {
       return res.status(403).json({ error: "Not admin" });
     }
 
-    req.user = decoded;
+    req.user = decoded; // optional
     next();
   } catch (e) {
     return res.status(401).json({ error: "Invalid token", details: String(e) });
   }
 }
-
-// ---- Optional: basic request log (helps Render logs) ----
-app.use((req, _res, next) => {
-  console.log("REQ", req.method, req.url);
-  next();
-});
 
 // ---- Health check ----
 app.get("/", (_req, res) => {
@@ -134,7 +132,7 @@ app.post("/sign", requireSignerKey, requireAdmin, (req, res) => {
       signature,
       folder,
       public_id: public_id ?? null,
-      stringToSign,
+      stringToSign, // debug
     });
   } catch (e) {
     return res.status(500).json({ error: String(e) });
