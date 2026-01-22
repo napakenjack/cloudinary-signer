@@ -21,9 +21,10 @@ const CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME;
 const API_KEY = process.env.CLOUDINARY_API_KEY;
 const API_SECRET = process.env.CLOUDINARY_API_SECRET;
 
-const SIGNER_KEY = process.env.SIGNER_KEY; // required
-const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || "").trim().toLowerCase(); // required
 const FIREBASE_SA_BASE64 = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64; // required
+
+// One-time bootstrap: allow only this UID to set roles (first admin)
+const BOOTSTRAP_ADMIN_UID = (process.env.BOOTSTRAP_ADMIN_UID || "").trim();
 
 // ---- Firebase Admin init ----
 function initFirebaseAdmin() {
@@ -54,45 +55,49 @@ app.use((req, _res, next) => {
   next();
 });
 
-// ---- Middleware: require x-signer-key ----
-function requireSignerKey(req, res, next) {
-  const got = req.header("x-signer-key");
-  if (!SIGNER_KEY) return res.status(500).json({ error: "Server SIGNER_KEY not set" });
-  if (!got || got !== SIGNER_KEY) return res.status(401).json({ error: "Invalid signer key" });
-  next();
+// ---- Helpers / Middleware ----
+function getBearerToken(req) {
+  const auth = req.header("authorization") || "";
+  return auth.startsWith("Bearer ") ? auth.slice(7).trim() : null;
 }
 
-// ---- Middleware: require Firebase admin (ID token) ----
-async function requireAdmin(req, res, next) {
+async function requireAuth(req, res, next) {
   try {
     if (!admin.apps.length) {
       return res.status(500).json({ error: "Firebase Admin not initialized" });
     }
-    if (!ADMIN_EMAIL) {
-      return res.status(500).json({ error: "Server ADMIN_EMAIL not set" });
-    }
 
-    const auth = req.header("authorization") || "";
-    const idToken = auth.startsWith("Bearer ") ? auth.slice(7).trim() : null;
+    const token = getBearerToken(req);
+    if (!token) return res.status(401).json({ error: "Missing Authorization Bearer token" });
 
-    if (!idToken) {
-      return res.status(401).json({ error: "Missing Authorization Bearer token" });
-    }
+    const decoded = await admin.auth().verifyIdToken(token);
 
-    const decoded = await admin.auth().verifyIdToken(idToken);
-
-    const email = (decoded.email || "").trim().toLowerCase();
-    if (!email) return res.status(403).json({ error: "Token has no email" });
-
-    if (email !== ADMIN_EMAIL) {
-      return res.status(403).json({ error: "Not admin" });
-    }
-
-    req.user = decoded; // optional
+    // decoded contains uid, email, and custom claims (like role)
+    req.user = decoded;
     next();
   } catch (e) {
     return res.status(401).json({ error: "Invalid token", details: String(e) });
   }
+}
+
+function requireRole(allowedRoles) {
+  return (req, res, next) => {
+    const role = req.user?.role || "user"; // custom claim "role"
+    if (!allowedRoles.includes(role)) {
+      return res.status(403).json({ error: "Forbidden", role });
+    }
+    next();
+  };
+}
+
+function requireBootstrapAdmin(req, res, next) {
+  if (!BOOTSTRAP_ADMIN_UID) {
+    return res.status(500).json({ error: "BOOTSTRAP_ADMIN_UID not set" });
+  }
+  if (req.user?.uid !== BOOTSTRAP_ADMIN_UID) {
+    return res.status(403).json({ error: "Forbidden (not bootstrap admin)" });
+  }
+  next();
 }
 
 // ---- Health check ----
@@ -100,8 +105,42 @@ app.get("/", (_req, res) => {
   res.send("OK");
 });
 
-// ---- Protected sign endpoint ----
-app.post("/sign", requireSignerKey, requireAdmin, (req, res) => {
+// ---- Debug: who am I + claims ----
+app.get("/me", requireAuth, (req, res) => {
+  const role = req.user?.role || "user";
+  return res.json({
+    uid: req.user?.uid,
+    email: req.user?.email || null,
+    role,
+    claims: req.user,
+  });
+});
+
+// ---- Set role: admin/moderator/user (bootstrap only) ----
+// Use this ONCE to make yourself admin, then later you can change protection to requireRole(["admin"])
+app.post("/roles/set", requireAuth, requireBootstrapAdmin, async (req, res) => {
+  try {
+    const { uid, role } = req.body;
+
+    if (!uid || typeof uid !== "string") {
+      return res.status(400).json({ error: "uid required" });
+    }
+
+    const allowed = ["admin", "moderator", "user"];
+    if (!allowed.includes(role)) {
+      return res.status(400).json({ error: "invalid role", allowed });
+    }
+
+    await admin.auth().setCustomUserClaims(uid, { role });
+
+    return res.json({ ok: true, uid, role });
+  } catch (e) {
+    return res.status(500).json({ error: String(e) });
+  }
+});
+
+// ---- Protected sign endpoint (ADMIN ONLY via custom claims) ----
+app.post("/sign", requireAuth, requireRole(["admin"]), (req, res) => {
   try {
     const { folder, public_id } = req.body;
     if (!folder) return res.status(400).json({ error: "folder required" });
@@ -132,7 +171,6 @@ app.post("/sign", requireSignerKey, requireAdmin, (req, res) => {
       signature,
       folder,
       public_id: public_id ?? null,
-      stringToSign, // debug
     });
   } catch (e) {
     return res.status(500).json({ error: String(e) });
