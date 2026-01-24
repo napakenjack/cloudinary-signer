@@ -5,6 +5,7 @@ import crypto from "crypto";
 import path from "path";
 import { fileURLToPath } from "url";
 import admin from "firebase-admin";
+import { v2 as cloudinary } from "cloudinary";
 
 // ---- Load .env for LOCAL only (Render uses dashboard env vars) ----
 const __filename = fileURLToPath(import.meta.url);
@@ -21,21 +22,27 @@ const CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME;
 const API_KEY = process.env.CLOUDINARY_API_KEY;
 const API_SECRET = process.env.CLOUDINARY_API_SECRET;
 
-const FIREBASE_SA_BASE64 = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64; // required
-
-// One-time bootstrap: allow only this UID to set roles (first admin)
-const BOOTSTRAP_ADMIN_UID = (process.env.BOOTSTRAP_ADMIN_UID || "").trim();
+// Render currently: FIREBASE_SERVICE_ACCOUNT_JSON (raw json)
+// Old: FIREBASE_SERVICE_ACCOUNT_BASE64 (base64 json)
+const FIREBASE_SERVICE_ACCOUNT_JSON = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+const FIREBASE_SERVICE_ACCOUNT_BASE64 = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64;
 
 // ---- Firebase Admin init ----
 function initFirebaseAdmin() {
-  if (!FIREBASE_SA_BASE64) {
-    console.error("Missing FIREBASE_SERVICE_ACCOUNT_BASE64");
-    return;
-  }
-
   try {
-    const json = Buffer.from(FIREBASE_SA_BASE64, "base64").toString("utf8");
-    const serviceAccount = JSON.parse(json);
+    let serviceAccount = null;
+
+    if (FIREBASE_SERVICE_ACCOUNT_JSON && FIREBASE_SERVICE_ACCOUNT_JSON.trim().startsWith("{")) {
+      serviceAccount = JSON.parse(FIREBASE_SERVICE_ACCOUNT_JSON);
+    } else if (FIREBASE_SERVICE_ACCOUNT_BASE64) {
+      const json = Buffer.from(FIREBASE_SERVICE_ACCOUNT_BASE64, "base64").toString("utf8");
+      serviceAccount = JSON.parse(json);
+    }
+
+    if (!serviceAccount) {
+      console.error("Missing FIREBASE_SERVICE_ACCOUNT_JSON or FIREBASE_SERVICE_ACCOUNT_BASE64");
+      return;
+    }
 
     if (!admin.apps.length) {
       admin.initializeApp({
@@ -49,30 +56,47 @@ function initFirebaseAdmin() {
 }
 initFirebaseAdmin();
 
-// ---- Optional: basic request log (helps Render logs) ----
+// ---- Cloudinary config ----
+function initCloudinary() {
+  if (!CLOUD_NAME || !API_KEY || !API_SECRET) {
+    console.error("Missing Cloudinary env vars");
+    return;
+  }
+  cloudinary.config({
+    cloud_name: CLOUD_NAME,
+    api_key: API_KEY,
+    api_secret: API_SECRET,
+  });
+  console.log("Cloudinary configured");
+}
+initCloudinary();
+
+// ---- Optional: basic request log ----
 app.use((req, _res, next) => {
   console.log("REQ", req.method, req.url);
   next();
 });
 
-// ---- Helpers / Middleware ----
-function getBearerToken(req) {
-  const auth = req.header("authorization") || "";
-  return auth.startsWith("Bearer ") ? auth.slice(7).trim() : null;
+// ---- Helpers ----
+function mustHaveEnv() {
+  if (!CLOUD_NAME || !API_KEY || !API_SECRET) {
+    throw new Error("Cloudinary env vars not set");
+  }
+  if (!admin.apps.length) {
+    throw new Error("Firebase Admin not initialized");
+  }
 }
 
+// Verify Firebase ID token
 async function requireAuth(req, res, next) {
   try {
-    if (!admin.apps.length) {
-      return res.status(500).json({ error: "Firebase Admin not initialized" });
-    }
+    mustHaveEnv();
 
-    const token = getBearerToken(req);
-    if (!token) return res.status(401).json({ error: "Missing Authorization Bearer token" });
+    const auth = req.header("authorization") || "";
+    const idToken = auth.startsWith("Bearer ") ? auth.slice(7).trim() : null;
+    if (!idToken) return res.status(401).json({ error: "Missing Authorization Bearer token" });
 
-    const decoded = await admin.auth().verifyIdToken(token);
-
-    // decoded contains uid, email, and custom claims (like role)
+    const decoded = await admin.auth().verifyIdToken(idToken);
     req.user = decoded;
     next();
   } catch (e) {
@@ -80,74 +104,50 @@ async function requireAuth(req, res, next) {
   }
 }
 
-function requireRole(allowedRoles) {
-  return (req, res, next) => {
-    const role = req.user?.role || "user"; // custom claim "role"
-    if (!allowedRoles.includes(role)) {
-      return res.status(403).json({ error: "Forbidden", role });
+// Check role from Firestore roles/{uid}
+async function requireAdmin(req, res, next) {
+  try {
+    if (!req.user?.uid) return res.status(401).json({ error: "No user in request" });
+
+    const roleDoc = await admin.firestore().collection("roles").doc(req.user.uid).get();
+    const role = (roleDoc.exists ? roleDoc.data()?.role : null) || "user";
+
+    if (role !== "admin") {
+      return res.status(403).json({ error: "Not admin" });
     }
     next();
-  };
+  } catch (e) {
+    return res.status(500).json({ error: "Role check failed", details: String(e) });
+  }
 }
 
-function requireBootstrapAdmin(req, res, next) {
-  if (!BOOTSTRAP_ADMIN_UID) {
-    return res.status(500).json({ error: "BOOTSTRAP_ADMIN_UID not set" });
+// (Optional) moderator or admin
+async function requireModeratorOrAdmin(req, res, next) {
+  try {
+    if (!req.user?.uid) return res.status(401).json({ error: "No user in request" });
+
+    const roleDoc = await admin.firestore().collection("roles").doc(req.user.uid).get();
+    const role = (roleDoc.exists ? roleDoc.data()?.role : null) || "user";
+
+    if (role !== "admin" && role !== "moderator") {
+      return res.status(403).json({ error: "Not allowed" });
+    }
+    next();
+  } catch (e) {
+    return res.status(500).json({ error: "Role check failed", details: String(e) });
   }
-  if (req.user?.uid !== BOOTSTRAP_ADMIN_UID) {
-    return res.status(403).json({ error: "Forbidden (not bootstrap admin)" });
-  }
-  next();
 }
 
 // ---- Health check ----
-app.get("/", (_req, res) => {
-  res.send("OK");
-});
+app.get("/", (_req, res) => res.send("OK"));
 
-// ---- Debug: who am I + claims ----
-app.get("/me", requireAuth, (req, res) => {
-  const role = req.user?.role || "user";
-  return res.json({
-    uid: req.user?.uid,
-    email: req.user?.email || null,
-    role,
-    claims: req.user,
-  });
-});
-
-// ---- Set role: admin/moderator/user (bootstrap only) ----
-// Use this ONCE to make yourself admin, then later you can change protection to requireRole(["admin"])
-app.post("/roles/set", requireAuth, requireBootstrapAdmin, async (req, res) => {
+// ---- SIGN endpoint (admin only) ----
+app.post("/sign", requireAuth, requireAdmin, (req, res) => {
   try {
-    const { uid, role } = req.body;
+    mustHaveEnv();
 
-    if (!uid || typeof uid !== "string") {
-      return res.status(400).json({ error: "uid required" });
-    }
-
-    const allowed = ["admin", "moderator", "user"];
-    if (!allowed.includes(role)) {
-      return res.status(400).json({ error: "invalid role", allowed });
-    }
-
-    await admin.auth().setCustomUserClaims(uid, { role });
-
-    return res.json({ ok: true, uid, role });
-  } catch (e) {
-    return res.status(500).json({ error: String(e) });
-  }
-});
-
-// ---- Protected sign endpoint (ADMIN ONLY via custom claims) ----
-app.post("/sign", requireAuth, requireRole(["admin"]), (req, res) => {
-  try {
     const { folder, public_id } = req.body;
     if (!folder) return res.status(400).json({ error: "folder required" });
-
-    if (!CLOUD_NAME || !API_KEY || !API_SECRET) {
-      return res.status(500).json({ error: "Cloudinary env vars not set" });
-    }
 
     const timestamp = Math.floor(Date.now() / 1000);
 
@@ -174,6 +174,28 @@ app.post("/sign", requireAuth, requireRole(["admin"]), (req, res) => {
     });
   } catch (e) {
     return res.status(500).json({ error: String(e) });
+  }
+});
+
+// ---- Cloudinary delete (admin only) ----
+// body: { "public_id": "aylan/products/xxx/img_..." }
+app.post("/cloudinary/delete", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    mustHaveEnv();
+
+    const { public_id } = req.body;
+    if (!public_id) return res.status(400).json({ error: "public_id required" });
+
+    // cloudinary admin destroy
+    const result = await cloudinary.uploader.destroy(public_id, {
+      resource_type: "image",
+      invalidate: true,
+    });
+
+    // result: { result: "ok" } or "not found"
+    return res.json({ ok: true, public_id, result });
+  } catch (e) {
+    return res.status(500).json({ error: "Cloudinary delete failed", details: String(e) });
   }
 });
 
